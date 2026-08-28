@@ -1,0 +1,9 @@
+**/.venv/
+**/node_modules/
+**/dist/
+**/__pycache__/
+*.pyc
+backend/knowledge/
+backend/backend_out.log
+backend/backend_err.log
+.expo/
