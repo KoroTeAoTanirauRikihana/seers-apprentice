@@ -33,6 +33,8 @@ from pathlib import Path
 from flask import Flask, jsonify, request
 from openai import OpenAI
 
+import device_memory
+import patient_store
 import sync_knowledge
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -185,7 +187,7 @@ def _split_into_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
-def _all_sections() -> list[dict]:
+def _read_sections_from_disk() -> list[dict]:
     # Recursive - the vault is organised into Foundations/, Norse-Specific/,
     # Celtic-Specific/, and Clan-Specific/ subfolders.
     files = sorted(KNOWLEDGE_DIR.glob("**/*.md")) if KNOWLEDGE_DIR.is_dir() else []
@@ -209,7 +211,7 @@ def _question_terms(question: str) -> list[str]:
 _BOILERPLATE_HEADINGS = {"(intro)"}
 
 
-def _retrieve_relevant(question: str, char_budget: int = 9000, min_sections: int = 3) -> str:
+def _retrieve_relevant_own(question: str, char_budget: int = 9000, min_sections: int = 3) -> str:
     """Same real fix already proven in the Tohunga's Apprentice Public App:
     score every section by keyword overlap (down-weighting terms common
     across most sections, since they can't discriminate), plus a flat
@@ -274,7 +276,71 @@ def _retrieve_relevant(question: str, char_budget: int = 9000, min_sections: int
     return "\n\n---\n\n".join(selected)
 
 
+# Knowledge sections are held in memory and only ever swapped for a
+# complete, non-empty set. Retrieval used to read the knowledge folder from
+# disk on every single request, which raced with the refresh thread's
+# rebuild of that same folder - see sync_knowledge.sync(). A half-written
+# folder can no longer reach a real question.
+_SECTIONS_LOCK = threading.Lock()
+_SECTIONS: list[dict] = []
+
+
+# The rest of the whanau's knowledge - every other apprentice's vault - via
+# the Koro Global Hub's warm cache (Koro, 2026-09-09: "I want it"). Local
+# only; if the Hub is not running this adds nothing and the app answers from
+# its own vault exactly as before.
+WHANAU_KNOWLEDGE_URL = "http://127.0.0.1:8765/api/v1/whanau-knowledge"
+
+
+def _whanau_knowledge(question: str) -> str:
+    try:
+        import json as _json
+        import urllib.parse as _up
+        import urllib.request as _ur
+
+        own_vault = str(getattr(sync_knowledge, "SOURCE", "") or "")
+        url = WHANAU_KNOWLEDGE_URL + "?" + _up.urlencode(
+            {"q": question[:600], "exclude": own_vault, "chars": 3500, "sections": 4}
+        )
+        with _ur.urlopen(url, timeout=8) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        return str(data.get("knowledge", "")).strip()
+    except Exception:
+        return ""
+
+
+def _retrieve_relevant(question: str, char_budget: int = 9000, min_sections: int = 3) -> str:
+    """This app's own knowledge first (the original body, untouched, as
+    _retrieve_relevant_own), then the relevant sections from the other
+    apprentices' vaults, each labelled with the apprentice it came from."""
+    own = _retrieve_relevant_own(question, char_budget=char_budget, min_sections=min_sections)
+    wider = _whanau_knowledge(question)
+    if not wider:
+        return own
+    if not own:
+        return wider
+    return own + "\n\n---\n\n" + wider
+
+
+def _rebuild_sections() -> int:
+    global _SECTIONS
+    try:
+        fresh = _read_sections_from_disk()
+    except OSError:
+        return len(_SECTIONS)  # keep the last good set rather than going blank
+    if fresh:
+        with _SECTIONS_LOCK:
+            _SECTIONS = fresh
+    return len(fresh)
+
+
+def _all_sections() -> list[dict]:
+    with _SECTIONS_LOCK:
+        return _SECTIONS
+
+
 KNOWLEDGE = _load_knowledge()
+_rebuild_sections()
 _last_refresh: dict = {"at": None, "synced_files": 0, "dropped_paragraphs": 0, "error": None}
 
 REFRESH_INTERVAL_HOURS = float(os.environ.get("SEERS_APPRENTICE_REFRESH_HOURS", "24"))
@@ -287,6 +353,7 @@ def _refresh_loop() -> None:
             if sync_knowledge.SOURCE.is_dir():
                 result = sync_knowledge.sync()
                 KNOWLEDGE = _load_knowledge()
+                _rebuild_sections()
                 _last_refresh.update(
                     at=datetime.now(timezone.utc).isoformat(),
                     synced_files=result["synced_files"],
@@ -324,6 +391,84 @@ def _rate_limited(ip: str) -> bool:
         return True
     _request_log[ip].append(now)
     return False
+
+
+
+def _authenticated_user_id() -> int | None:
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+    return patient_store.resolve_session(token) if token else None
+
+
+CONSENT_TEXT = (
+    "Creating an account lets me remember our real conversation history so "
+    "you don't have to re-explain yourself every time - your messages are "
+    "stored encrypted on Koro's own server. You can delete your account and "
+    "every stored message permanently at any time. This is optional - you "
+    "can keep using me anonymously with no account and nothing stored."
+)
+
+
+@app.post("/auth/signup")
+def auth_signup():
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email", "")).strip()
+    password = str(payload.get("password", ""))
+    consent = bool(payload.get("consent", False))
+    try:
+        user_id = patient_store.create_user(email, password, consent)
+    except patient_store.AccountError as exc:
+        return jsonify({"error": str(exc)}), 400
+    token = patient_store.create_session(user_id)
+    return jsonify({"token": token, "email": email})
+
+
+@app.post("/auth/login")
+def auth_login():
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email", "")).strip()
+    password = str(payload.get("password", ""))
+    try:
+        user_id = patient_store.authenticate_user(email, password)
+    except patient_store.AccountError as exc:
+        return jsonify({"error": str(exc)}), 401
+    token = patient_store.create_session(user_id)
+    return jsonify({"token": token, "email": email})
+
+
+@app.post("/auth/logout")
+def auth_logout():
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+    if token:
+        patient_store.destroy_session(token)
+    return jsonify({"ok": True})
+
+
+@app.get("/auth/me")
+def auth_me():
+    user_id = _authenticated_user_id()
+    if not user_id:
+        return jsonify({"authenticated": False, "consent_text": CONSENT_TEXT})
+    return jsonify({"authenticated": True})
+
+
+@app.get("/conversations/history")
+def conversation_history():
+    user_id = _authenticated_user_id()
+    if not user_id:
+        return jsonify({"error": "Not logged in."}), 401
+    history = patient_store.get_recent_history(user_id)
+    return jsonify({"messages": [{"role": m["role"], "text": m["content"]} for m in history]})
+
+
+@app.post("/account/delete")
+def account_delete():
+    user_id = _authenticated_user_id()
+    if not user_id:
+        return jsonify({"error": "Not logged in."}), 401
+    patient_store.delete_user(user_id)
+    return jsonify({"ok": True})
 
 
 @app.get("/")
@@ -368,14 +513,54 @@ def ask():
 
     payload = request.get_json(silent=True) or {}
     question = str(payload.get("question", "")).strip()
+    device_id = str(payload.get("device_id", "")).strip()
     if not question:
         return jsonify({"error": "A question is required."}), 400
     if not KNOWLEDGE:
         return jsonify({"error": "Knowledge base is empty - run sync_knowledge.py first."}), 500
 
+    user_id = _authenticated_user_id()
+
+    history_block = ""
+    memory_ctx = None
+    if user_id:
+        # Real account (see patient_store.py) - use its own richer history.
+        history = patient_store.get_recent_history(user_id)
+        if history:
+            lines = [f"{h['role'].upper()}: {h['content']}" for h in history]
+            history_block = (
+                "Real prior conversation history with this same person (for continuity only):\n\n"
+                + "\n\n".join(lines)
+                + "\n\n---\n\n"
+            )
+    elif device_id:
+        # No account - most visitors never sign up. Real, permanent,
+        # anonymous device-based memory instead (device_memory.py), per
+        # Koro's own confirmed design: no login required to be remembered.
+        memory_ctx = device_memory.build_memory_context(device_id, question)
+        history_block = memory_ctx["prompt_section"]
+
     relevant = _retrieve_relevant(question)
+    if not relevant.strip():
+        # Never call the model with an empty knowledge block. With nothing
+        # retrieved it answers from its own recall - invented facts, figures
+        # and requirements - to a real person who will act on them.
+        return jsonify(
+            {
+                "answer": (
+                    "I'm sorry - I don't have anything in my knowledge here that "
+                    "actually answers that, and I won't guess at it, because you'd "
+                    "be acting on a guess.\n\n"
+                    "Try asking it again in different words and I'll look again."
+                ),
+                "disclaimer": DISCLAIMER,
+            }
+        )
+
     client = OpenAI(api_key=OPENAI_API_KEY)
-    prompt = f"Relevant knowledge excerpts:\n\n{relevant}\n\n---\n\nQuestion: {question}"
+
+    prompt = f"{history_block}Relevant knowledge excerpts:\n\n{relevant}\n\n---\n\nQuestion: {question}"
+
     try:
         response = client.chat.completions.create(
             model=MODEL,
@@ -385,8 +570,14 @@ def ask():
             ],
         )
         answer = response.choices[0].message.content
-    except Exception as exc:  # noqa: BLE001 - surfaced to the caller as a plain error
+    except Exception as exc:  # noqa: BLE001
         return jsonify({"error": f"Failed to get an answer: {exc}"}), 502
+
+    if user_id:
+        patient_store.save_message(user_id, "user", question)
+        patient_store.save_message(user_id, "assistant", answer)
+    elif memory_ctx and memory_ctx["active"]:
+        device_memory.remember_exchange(device_id, memory_ctx["person_name"], question, answer)
 
     return jsonify({"answer": answer, "disclaimer": DISCLAIMER})
 
