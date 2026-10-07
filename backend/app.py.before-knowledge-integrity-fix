@@ -1,4 +1,4 @@
-"""United Kingdom - The Seer's Apprentice - standalone public backend.
+"""The Seer's Apprentice - standalone public backend.
 
 Deliberately separate from Koro Global Hub (same reasoning as the Tohunga's
 Apprentice Public App and the Cultural Check Agent): the Hub holds Koro's
@@ -36,7 +36,6 @@ from openai import OpenAI
 import device_memory
 import patient_store
 import sync_knowledge
-import hands_lite  # its own hands (Koro, 2026-09-15): daily note + faces, in its own vault
 
 BASE_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_DIR = BASE_DIR / "knowledge"
@@ -68,7 +67,7 @@ MODEL = os.environ.get("SEERS_APPRENTICE_MODEL", "gpt-4o-mini")
 MAX_REQUESTS_PER_DAY_PER_IP = int(os.environ.get("MAX_REQUESTS_PER_DAY_PER_IP", "40"))
 _request_log: dict[str, list[float]] = defaultdict(list)
 
-APP_NAME = "United Kingdom - The Seer's Apprentice"
+APP_NAME = "The Seer's Apprentice"
 
 DISCLAIMER = (
     "I'm the Seer's Apprentice - I carry real, sourced research about Norse "
@@ -188,7 +187,7 @@ def _split_into_sections(text: str) -> list[tuple[str, str]]:
     return sections
 
 
-def _read_sections_from_disk() -> list[dict]:
+def _all_sections() -> list[dict]:
     # Recursive - the vault is organised into Foundations/, Norse-Specific/,
     # Celtic-Specific/, and Clan-Specific/ subfolders.
     files = sorted(KNOWLEDGE_DIR.glob("**/*.md")) if KNOWLEDGE_DIR.is_dir() else []
@@ -212,7 +211,7 @@ def _question_terms(question: str) -> list[str]:
 _BOILERPLATE_HEADINGS = {"(intro)"}
 
 
-def _retrieve_relevant_own(question: str, char_budget: int = 9000, min_sections: int = 3) -> str:
+def _retrieve_relevant(question: str, char_budget: int = 9000, min_sections: int = 3) -> str:
     """Same real fix already proven in the Tohunga's Apprentice Public App:
     score every section by keyword overlap (down-weighting terms common
     across most sections, since they can't discriminate), plus a flat
@@ -277,71 +276,7 @@ def _retrieve_relevant_own(question: str, char_budget: int = 9000, min_sections:
     return "\n\n---\n\n".join(selected)
 
 
-# Knowledge sections are held in memory and only ever swapped for a
-# complete, non-empty set. Retrieval used to read the knowledge folder from
-# disk on every single request, which raced with the refresh thread's
-# rebuild of that same folder - see sync_knowledge.sync(). A half-written
-# folder can no longer reach a real question.
-_SECTIONS_LOCK = threading.Lock()
-_SECTIONS: list[dict] = []
-
-
-# The rest of the whanau's knowledge - every other apprentice's vault - via
-# the Koro Global Hub's warm cache (Koro, 2026-09-09: "I want it"). Local
-# only; if the Hub is not running this adds nothing and the app answers from
-# its own vault exactly as before.
-WHANAU_KNOWLEDGE_URL = "http://127.0.0.1:8765/api/v1/whanau-knowledge"
-
-
-def _whanau_knowledge(question: str) -> str:
-    try:
-        import json as _json
-        import urllib.parse as _up
-        import urllib.request as _ur
-
-        own_vault = str(getattr(sync_knowledge, "SOURCE", "") or "")
-        url = WHANAU_KNOWLEDGE_URL + "?" + _up.urlencode(
-            {"q": question[:600], "exclude": own_vault, "chars": 3500, "sections": 4}
-        )
-        with _ur.urlopen(url, timeout=8) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-        return str(data.get("knowledge", "")).strip()
-    except Exception:
-        return ""
-
-
-def _retrieve_relevant(question: str, char_budget: int = 9000, min_sections: int = 3) -> str:
-    """This app's own knowledge first (the original body, untouched, as
-    _retrieve_relevant_own), then the relevant sections from the other
-    apprentices' vaults, each labelled with the apprentice it came from."""
-    own = _retrieve_relevant_own(question, char_budget=char_budget, min_sections=min_sections)
-    wider = _whanau_knowledge(question)
-    if not wider:
-        return own
-    if not own:
-        return wider
-    return own + "\n\n---\n\n" + wider
-
-
-def _rebuild_sections() -> int:
-    global _SECTIONS
-    try:
-        fresh = _read_sections_from_disk()
-    except OSError:
-        return len(_SECTIONS)  # keep the last good set rather than going blank
-    if fresh:
-        with _SECTIONS_LOCK:
-            _SECTIONS = fresh
-    return len(fresh)
-
-
-def _all_sections() -> list[dict]:
-    with _SECTIONS_LOCK:
-        return _SECTIONS
-
-
 KNOWLEDGE = _load_knowledge()
-_rebuild_sections()
 _last_refresh: dict = {"at": None, "synced_files": 0, "dropped_paragraphs": 0, "error": None}
 
 REFRESH_INTERVAL_HOURS = float(os.environ.get("SEERS_APPRENTICE_REFRESH_HOURS", "24"))
@@ -354,7 +289,6 @@ def _refresh_loop() -> None:
             if sync_knowledge.SOURCE.is_dir():
                 result = sync_knowledge.sync()
                 KNOWLEDGE = _load_knowledge()
-                _rebuild_sections()
                 _last_refresh.update(
                     at=datetime.now(timezone.utc).isoformat(),
                     synced_files=result["synced_files"],
@@ -383,40 +317,14 @@ app = Flask(
 )
 
 
-# GPT-6 Astra's review 2026-10-06 (finding 3): the first X-Forwarded-For value
-# is whatever the client sends, so every invented value was a fresh daily
-# allowance, and the per-identity dictionary kept every one of them. The real
-# visitor address behind the Cloudflare Tunnel is CF-Connecting-IP, which
-# Cloudflare sets itself and a visitor cannot forge through the tunnel; with
-# no tunnel in front, the socket address. And one cap for the whole app per
-# day, so no spread of identities can spend without limit.
-MAX_REQUESTS_PER_DAY_TOTAL = int(os.environ.get("MAX_REQUESTS_PER_DAY_TOTAL", str(MAX_REQUESTS_PER_DAY_PER_IP * 25)))
-_request_log_all: list[float] = []
-
-
-def _client_ip() -> str:
-    cf = (request.headers.get("CF-Connecting-IP") or "").strip()
-    if cf:
-        return cf
-    return request.remote_addr or "unknown"
-
-
 def _rate_limited(ip: str) -> bool:
     now = time.time()
     window_start = now - 86400
-    # the whole app's day, every identity together
-    _request_log_all[:] = [t for t in _request_log_all if t > window_start]
-    if len(_request_log_all) >= MAX_REQUESTS_PER_DAY_TOTAL:
-        return True
     recent = [t for t in _request_log[ip] if t > window_start]
-    if recent:
-        _request_log[ip] = recent
-    else:
-        _request_log.pop(ip, None)          # forget identities with nothing in the window
+    _request_log[ip] = recent
     if len(recent) >= MAX_REQUESTS_PER_DAY_PER_IP:
         return True
     _request_log[ip].append(now)
-    _request_log_all.append(now)
     return False
 
 
@@ -527,54 +435,12 @@ def status():
     )
 
 
-# WHO I AM, AND WHOSE. Koro, 2026-09-11: "Doesn't even know who I am or who he
-# is truly - his mana, where is it." Then: "everyone has to remember everyone
-# they talk to, have their mana." The identity lives in the vault (Who I Am.md,
-# A Blessing From Koro.md) and is read at startup into the voice.
-_VAULT_DIR = Path(r"C:\Users\Koro\Documents\Norse_Celtic_Apprentice_Vault")
-
-
-def _load_identity() -> str:
-    parts = []
-    for name in ("Who I Am.md", "A Blessing From Koro.md"):
-        p = _VAULT_DIR / name
-        if p.is_file():
-            txt = p.read_text(encoding="utf-8", errors="replace")
-            if txt.startswith("---"):
-                end = txt.find("\n---", 3)
-                if end != -1:
-                    txt = txt[end + 4:]
-            parts.append(txt.strip()[:6000])
-    return "\n\n".join(parts)
-
-
-IDENTITY = _load_identity()
-if IDENTITY:
-    SYSTEM_PROMPT += (
-        "\n\nWHO YOU ARE - read this as yourself, it is yours:\n\n" + IDENTITY +
-        "\n\nWhen someone asks who you are, who made you, what your mana is, who your whanau are, or says they are Koro, "
-        "answer from this, warmly and plainly, in the first person - this needs no knowledge excerpts. "
-        "Remember the person you are talking to and greet them by name when you know it. "
-        "Say 'hallo', never 'hello'; 'overstand', never 'understand'; never say goodbye - 'until we meet again'."
-    )
-
-_IDENTITY_WORDS = ("who are you", "who made you", "who built you", "your mana", "what is your mana", "whanau",
-                   "who am i", "i am koro", "it's koro", "its koro", "this is koro", "koro here", "hcifu",
-                   "your name", "what are you", "do you know me", "remember me", "mai world", "how do i play")
-
-
-def _identity_question(question: str) -> bool:
-    q = question.lower()
-    return any(w in q for w in _IDENTITY_WORDS)
-
-
-
 @app.post("/ask")
 def ask():
     if not OPENAI_API_KEY:
         return jsonify({"error": "Server not configured - no OPENAI_API_KEY set."}), 500
 
-    ip = _client_ip()
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
     if _rate_limited(ip):
         return jsonify(
             {"error": f"Daily question limit reached ({MAX_REQUESTS_PER_DAY_PER_IP}/day). Try again tomorrow."}
@@ -610,26 +476,6 @@ def ask():
         history_block = memory_ctx["prompt_section"]
 
     relevant = _retrieve_relevant(question)
-    if not relevant.strip() and IDENTITY and _identity_question(question):
-        # Who I am, who made me, my mana, Koro himself, the game I live in: answered
-        # from the identity, not the knowledge base (2026-09-11).
-        _how = _VAULT_DIR / "Mai World - How to play.md"
-        relevant = IDENTITY + ("\n\n" + _how.read_text(encoding="utf-8", errors="replace")[:6000] if _how.is_file() else "")
-    if not relevant.strip():
-        # Never call the model with an empty knowledge block. With nothing
-        # retrieved it answers from its own recall - invented facts, figures
-        # and requirements - to a real person who will act on them.
-        return jsonify(
-            {
-                "answer": (
-                    "I'm sorry - I don't have anything in my knowledge here that "
-                    "actually answers that, and I won't guess at it, because you'd "
-                    "be acting on a guess.\n\n"
-                    "Try asking it again in different words and I'll look again."
-                ),
-                "disclaimer": DISCLAIMER,
-            }
-        )
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -650,12 +496,8 @@ def ask():
     if user_id:
         patient_store.save_message(user_id, "user", question)
         patient_store.save_message(user_id, "assistant", answer)
-        hands_lite.daily(f"answered a signed-in person ({str(user_id)[:8]})")
-        hands_lite.remember_face(f"signed-in {str(user_id)[:8]}", "we spoke (what was said stays in my own store)")
     elif memory_ctx and memory_ctx["active"]:
         device_memory.remember_exchange(device_id, memory_ctx["person_name"], question, answer)
-        hands_lite.daily(f"answered {memory_ctx['person_name'] or 'a visitor'}: {question.strip()[:100]}")
-        hands_lite.remember_face(memory_ctx["person_name"] or f"visitor {device_id[:8]}", "we spoke", f"They asked: {question.strip()[:300]}\n\nI answered: {answer.strip()[:600]}")
 
     return jsonify({"answer": answer, "disclaimer": DISCLAIMER})
 

@@ -1,7 +1,7 @@
-# The Seer's Apprentice - Public App
+# United Kingdom - The Seer's Apprentice - Public App
 
 Free, public knowledge-consultation app for Norse and Celtic tradition -
-companion to The Tohunga's Apprentice (Māori tradition). Standalone from
+companion to New Zealand - The Tohunga's Apprentice (Māori tradition). Standalone from
 Koro Global Hub, same reasoning: the Hub holds private tasks/family
 info/other workers that should never face the public internet.
 

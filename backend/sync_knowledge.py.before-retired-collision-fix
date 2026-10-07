@@ -98,11 +98,9 @@ def _swap_in(staging: Path, retired: Path, attempts: int = 10) -> None:
     for attempt in range(attempts):
         try:
             if DEST.exists():
-                if retired.exists():
-                    retired = retired.with_name(f"{retired.name}.{attempt}")  # never rename onto a name that exists
                 DEST.rename(retired)
             staging.rename(DEST)
-            return retired
+            return
         except OSError as exc:
             last_error = exc
             if retired.exists() and not DEST.exists():
@@ -141,21 +139,8 @@ def _sync_locked() -> dict:
     # name can.
     _tag = f".new.{_os.getpid()}"
     staging = real_dest.parent / (real_dest.name + _tag)
-    # 2026-09-15: retired is named per SYNC, not per process. A leftover
-    # knowledge.old.<pid> that rmtree could not fully remove (a reader still
-    # held a file in it) made every later rename in that process fail with
-    # WinError 183 - seen live on the Comorians' and Magyars' apps. Stale
-    # .old.* folders are swept only once they are 10 minutes old, because a
-    # fresh one may belong to another process mid-swap.
-    retired = real_dest.parent / (real_dest.name + f".old.{_os.getpid()}.{int(_time.time() * 1000)}")
-    stale = []
-    for p in real_dest.parent.glob(real_dest.name + ".old.*"):
-        try:
-            if p.is_dir() and _time.time() - p.stat().st_mtime > 600:
-                stale.append(p)
-        except OSError:
-            continue
-    for leftover in [staging, retired] + stale:
+    retired = real_dest.parent / (real_dest.name + f".old.{_os.getpid()}")
+    for leftover in (staging, retired):
         if leftover.exists():
             _shutil.rmtree(leftover, ignore_errors=True)
 
@@ -173,7 +158,7 @@ def _sync_locked() -> dict:
         _shutil.rmtree(staging, ignore_errors=True)
         raise RuntimeError("Refusing to sync: no knowledge files found in the source vault")
 
-    retired = _swap_in(staging, retired) or retired
+    _swap_in(staging, retired)
     _shutil.rmtree(retired, ignore_errors=True)
     return result
 
