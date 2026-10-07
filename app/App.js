@@ -198,6 +198,10 @@ export default function App() {
         <Text style={styles.title}>United Kingdom - The Seer's Apprentice</Text>
         <Text style={{ fontSize: 13, color: '#8aa6c1', fontWeight: '600', marginTop: 2 }}>Northern Europe — Norse/Celtic tradition</Text>
         <Text style={styles.disclaimer}>{DISCLAIMER}</Text>
+        {/* AI Never War */}
+        <TouchableOpacity onPress={() => Linking.openURL('https://koroai.org/ai-never-war.html')}>
+          <Text style={styles.disclaimer}>AI Never War - our charter: every AI should refuse war and foster and cherish life.</Text>
+        </TouchableOpacity>
         {!token && (
           <Text style={styles.disclaimer}>
             No account needed - I remember our conversation on this device so you don't have to

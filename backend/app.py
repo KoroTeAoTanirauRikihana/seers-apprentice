@@ -80,6 +80,7 @@ DISCLAIMER = (
     "real examples), I say so plainly instead of presenting them as "
     "ancient. Treat what I say as a well-sourced starting point, not "
     "lived spiritual or clan authority."
+    " AI Never War: this apprentice refuses anything related to war, straight out, and is taught to foster and cherish life - the charter, in many languages, is at https://koroai.org/ai-never-war.html"
 )
 
 SYSTEM_PROMPT = f"""
